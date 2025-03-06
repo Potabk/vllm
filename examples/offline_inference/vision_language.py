@@ -645,7 +645,7 @@ def run_qwen2_vl(questions: list[str], modality: str):
 # Qwen2.5-VL
 def run_qwen2_5_vl(questions: list[str], modality: str):
 
-    model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
+    model_name = "/root/wl/cache/modelscope/models/Qwen/Qwen2.5-VL-7B-Instruct"
 
     llm = LLM(
         model=model_name,
@@ -845,7 +845,7 @@ if __name__ == "__main__":
     parser.add_argument('--model-type',
                         '-m',
                         type=str,
-                        default="llava",
+                        default="qwen2_5_vl",
                         choices=model_example_map.keys(),
                         help='Huggingface "model_type".')
     parser.add_argument('--num-prompts',
