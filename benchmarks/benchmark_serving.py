@@ -273,6 +273,7 @@ async def benchmark(
         input_requests[0].expected_output_len, \
             input_requests[0].multi_modal_data
 
+    print(input_requests[0].multi_modal_data)
     if backend != "openai-chat" and test_mm_content is not None:
         # multi-modal benchmark is only available on OpenAI Chat backend.
         raise ValueError(

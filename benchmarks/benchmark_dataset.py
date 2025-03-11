@@ -613,7 +613,7 @@ class VisionArenaDataset(BenchmarkDataset):
 
     DEFAULT_OUTPUT_LEN = 128
     DEFAULT_NUM_REQUESTS = 1000
-    VISION_ARENA_DATASET_PATH = "lmarena-ai/vision-arena-bench-v0.1"
+    VISION_ARENA_DATASET_PATH = "/root/wl/cache/huggingface/datasets/vision-arena-bench-v0.1"
 
     def __init__(
         self,
