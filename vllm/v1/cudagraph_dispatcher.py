@@ -165,8 +165,9 @@ class CudagraphDispatcher:
     def initialize_cudagraph_keys(
         self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int = 1
     ):
-        # This should be called only after attention backend is initialized. So we can
-        # get the correct cudagraph mode after backend support is resolved.
+        # This should be called only after attention backend is initialized.
+        # So we can get the correct cudagraph mode after backend support is
+        # resolved.
         self.cudagraph_mode = cudagraph_mode
 
         # Early exit if cudagraphs are disabled
@@ -185,51 +186,100 @@ class CudagraphDispatcher:
         # Note: we create all valid keys for cudagraph here but do not
         # guarantee all keys would be used. For example, if we allow lazy
         # capturing in future PR, some keys may never be triggered.
-        if cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE:
-            assert self.compilation_config.cudagraph_capture_sizes is not None, (
-                "Cudagraph capture sizes must be set when mixed mode is enabled."
-            )
-            for bs, num_active_loras in product(
-                self.compilation_config.cudagraph_capture_sizes, lora_cases
-            ):
-                batch_desc = self._create_padded_batch_descriptor(
-                    bs, False, num_active_loras > 0, num_active_loras
-                )
-                # Only relax for PIECEWISE mode. FULL mode needs exact num_reqs
-                # because FA3's scheduler_metadata computation depends on it.
-                if cudagraph_mode.mixed_mode() == CUDAGraphMode.PIECEWISE:
-                    batch_desc = replace(batch_desc, num_reqs=None, uniform=False)
-                self.add_cudagraph_key(cudagraph_mode.mixed_mode(), batch_desc)
+        if cudagraph_mode == CUDAGraphMode.FULL:
+            # All batches (mixed prefill-decode and pure decode) use FULL
+            # cudagraph. FULL mode needs exact num_reqs because FA3's
+            # scheduler_metadata computation depends on it.
+            self._add_mixed_keys(CUDAGraphMode.FULL, lora_cases, relax=False)
 
-        # if decode cudagraph mode is FULL, and we don't already have mixed
-        # mode full cudagraphs then add them here.
-        if (
-            cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
-            and cudagraph_mode.separate_routine()
-        ):
-            max_num_tokens = (
-                uniform_decode_query_len
-                * self.vllm_config.scheduler_config.max_num_seqs
+        elif cudagraph_mode == CUDAGraphMode.PIECEWISE:
+            # All batches use PIECEWISE cudagraph (attention is compiled
+            # separately, graph only captures non-attention parts).
+            # num_reqs is relaxed because PIECEWISE doesn't need it.
+            self._add_mixed_keys(
+                CUDAGraphMode.PIECEWISE, lora_cases, relax=True
             )
-            assert self.compilation_config.cudagraph_capture_sizes is not None, (
-                "Cudagraph capture sizes must be set when full mode is enabled."
+
+        elif cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
+            # Only pure decode batches get FULL cudagraph.
+            # Mixed prefill-decode batches run without cudagraph (eager).
+            self._add_decode_only_keys(
+                uniform_decode_query_len, lora_cases
             )
-            cudagraph_capture_sizes_for_decode = [
-                x
-                for x in self.compilation_config.cudagraph_capture_sizes
-                if x <= max_num_tokens and x >= uniform_decode_query_len
-            ]
-            for bs, num_active_loras in product(
-                cudagraph_capture_sizes_for_decode, lora_cases
-            ):
-                self.add_cudagraph_key(
-                    CUDAGraphMode.FULL,
-                    self._create_padded_batch_descriptor(
-                        bs, True, num_active_loras > 0, num_active_loras
-                    ),
-                )
+
+        elif cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE:
+            # Pure decode batches get FULL cudagraph for best performance.
+            # Mixed prefill-decode batches get PIECEWISE cudagraph as
+            # fallback (attention backend doesn't support FULL for mixed).
+            self._add_mixed_keys(
+                CUDAGraphMode.PIECEWISE, lora_cases, relax=True
+            )
+            self._add_decode_only_keys(
+                uniform_decode_query_len, lora_cases
+            )
 
         self.keys_initialized = True
+
+    def _add_mixed_keys(
+        self,
+        runtime_mode: CUDAGraphMode,
+        lora_cases: list[int],
+        relax: bool,
+    ) -> None:
+        """Register cudagraph keys for mixed prefill-decode batches.
+
+        Args:
+            runtime_mode: FULL or PIECEWISE.
+            lora_cases: LoRA active counts to enumerate.
+            relax: If True, set num_reqs=None and uniform=False on the
+                descriptor. PIECEWISE mode doesn't need exact num_reqs;
+                FULL mode does (FA3's scheduler_metadata depends on it).
+        """
+        assert self.compilation_config.cudagraph_capture_sizes is not None, (
+            "Cudagraph capture sizes must be set when mixed mode is enabled."
+        )
+        for bs, num_active_loras in product(
+            self.compilation_config.cudagraph_capture_sizes, lora_cases
+        ):
+            batch_desc = self._create_padded_batch_descriptor(
+                bs, False, num_active_loras > 0, num_active_loras
+            )
+            if relax:
+                batch_desc = replace(batch_desc, num_reqs=None, uniform=False)
+            self.add_cudagraph_key(runtime_mode, batch_desc)
+
+    def _add_decode_only_keys(
+        self,
+        uniform_decode_query_len: int,
+        lora_cases: list[int],
+    ) -> None:
+        """Register FULL cudagraph keys for pure decode batches only.
+
+        Decode batches are uniform (all requests have the same query_len),
+        so FULL cudagraph can be used even when the attention backend
+        doesn't support mixed batches.
+        """
+        max_num_tokens = (
+            uniform_decode_query_len
+            * self.vllm_config.scheduler_config.max_num_seqs
+        )
+        assert self.compilation_config.cudagraph_capture_sizes is not None, (
+            "Cudagraph capture sizes must be set when full mode is enabled."
+        )
+        cudagraph_capture_sizes_for_decode = [
+            x
+            for x in self.compilation_config.cudagraph_capture_sizes
+            if x <= max_num_tokens and x >= uniform_decode_query_len
+        ]
+        for bs, num_active_loras in product(
+            cudagraph_capture_sizes_for_decode, lora_cases
+        ):
+            self.add_cudagraph_key(
+                CUDAGraphMode.FULL,
+                self._create_padded_batch_descriptor(
+                    bs, True, num_active_loras > 0, num_active_loras
+                ),
+            )
 
     def dispatch(
         self,
