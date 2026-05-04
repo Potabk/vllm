@@ -308,9 +308,24 @@ class NixlConnectorWorker:
 
         self.use_mla = self.model_config.use_mla
 
-        # Get the attention backend from the first layer
+        # Collect layer names for the *primary* (first non-Mamba) attention
+        # group only.  Spec-decode draft models (e.g. EAGLE3) occupy a
+        # separate kv_cache_group whose backends may accept different kernel
+        # block sizes (e.g. FlashAttention MultipleOf(16) vs FlashMLA [64]).
+        # Including those backends here would cause select_common_block_size()
+        # to pick a smaller common size and inflate
+        # _physical_blocks_per_logical_kv_block,
+        # making self.num_blocks inconsistent with the actual tensor shape[0].
+        self._primary_attn_layer_names: list[str] | None = None
+        for _group in kv_cache_config.kv_cache_groups:
+            if not isinstance(_group.kv_cache_spec, MambaSpec):
+                self._primary_attn_layer_names = list(_group.layer_names)
+                break
+
         # NOTE (NickLucche) models with multiple backends are not supported yet
-        self.attn_backends = get_current_attn_backends(vllm_config)
+        self.attn_backends = get_current_attn_backends(
+            vllm_config, self._primary_attn_layer_names
+        )
         self.backend_name = self.attn_backends[0].get_name()
 
         self.kv_cache_layout = get_kv_cache_layout()
@@ -335,8 +350,11 @@ class NixlConnectorWorker:
         )
 
     def _sync_block_size_with_kernel(self) -> None:
-        backends = get_current_attn_backends(self.vllm_config)
-        kernel_block_size = select_common_block_size(self.block_size, backends)
+        # Reuse self.attn_backends, already scoped to the primary attention
+        # group; avoids double-fetching and keeps block-size logic consistent.
+        kernel_block_size = select_common_block_size(
+            self.block_size, self.attn_backends
+        )
         # Number of blocks not accounting for kernel block mismatches
         self._logical_num_blocks = self.num_blocks
         if self.block_size != kernel_block_size:
@@ -734,6 +752,26 @@ class NixlConnectorWorker:
                 if isinstance(layer_spec, MambaSpec)
                 else self.num_blocks
             )
+            # Spec-decode draft models (e.g. EAGLE3) may live in a separate
+            # kv_cache_group that uses a different attention backend, giving
+            # those tensors a different physical block count.  Detect this by
+            # comparing the actual tensor shape against the expected num_blocks
+            # rather than by group membership, so that legitimate secondary
+            # groups (e.g. sliding-window attention) with the same backend and
+            # block count are still registered correctly.
+            if not isinstance(layer_spec, MambaSpec) and cache_list:
+                first_cache = next(iter(cache_list))
+                if first_cache.shape[0] != num_blocks:
+                    logger.debug(
+                        "Skipping layer %s from nixl registration: "
+                        "shape[0]=%d != expected num_blocks=%d "
+                        "(spec-decode draft model with a different "
+                        "kernel block size?)",
+                        layer_name,
+                        first_cache.shape[0],
+                        num_blocks,
+                    )
+                    continue
             # `page_size` accounts for physical blocks, st KVCache is always
             # [`num_blocks` * `page_size`]
             curr_tensor_size_bytes = num_blocks * physical_page_size
